@@ -1,9 +1,10 @@
-use base64::{engine::general_purpose, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::error::Error;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
+
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 mod forwarder;
 mod protocol;
@@ -24,85 +25,146 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let config_content = std::fs::read_to_string("config.yaml")?;
     let config: Config = serde_yml::from_str(&config_content)?;
 
-    let connect_url = format!("{}/register", config.relay_server);
-    let url = url::Url::parse(&connect_url)?;
-
-    let mut request =
-        tokio_tungstenite::tungstenite::handshake::client::Request::get(url.to_string()).body(())?;
-
-    request
-        .headers_mut()
-        .insert("x-api-key", config.api_key.parse()?);
-    request
-        .headers_mut()
-        .insert("appname", config.app_name.parse()?);
+    let connect_url = format!(
+        "{}/register?appname={}",
+        config.relay_server, config.app_name
+    );
 
     println!("Connecting to {}...", connect_url);
 
-    let (ws_stream, _) = connect_async(request).await?;
-    println!("Connected to Relay Server!");
-
-    let (mut write, mut read) = ws_stream.split();
-    let forwarder = std::sync::Arc::new(Forwarder::new(config.local_target.clone()));
-
-    // Create a channel to send messages from worker tasks to the WebSocket writer
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<ResponseMessage>(100);
-
-    // Spawn a task to handle outgoing WebSocket messages
-    tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            let json = serde_json::to_string(&msg).unwrap();
-            if let Err(e) = write.send(Message::Text(json)).await {
-                eprintln!("Failed to send message: {}", e);
-                break;
-            }
-        }
-    });
-
-    while let Some(msg) = read.next().await {
-        let msg = match msg {
-            Ok(m) => m,
+    loop {
+        let mut request = match connect_url.clone().into_client_request() {
+            Ok(req) => req,
             Err(e) => {
-                eprintln!("Error reading message: {}", e);
-                break;
+                eprintln!("Failed to create request: {}", e);
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                continue;
             }
         };
 
-        if let Message::Text(text) = msg {
-            if let Ok(req) = serde_json::from_str::<Request>(&text) {
-                let forwarder = forwarder.clone();
-                let tx = tx.clone();
+        let _ = request
+            .headers_mut()
+            .insert("x-api-key", config.api_key.parse().unwrap());
+        let _ = request
+            .headers_mut()
+            .insert("appname", config.app_name.parse().unwrap());
 
-                tokio::spawn(async move {
-                    match forwarder.forward(req.clone()).await {
-                        Ok((status, mut stream)) => {
-                            while let Some(chunk_res) = stream.next().await {
-                                match chunk_res {
-                                    Ok(chunk) => {
-                                        let encoded = general_purpose::STANDARD.encode(&chunk);
-                                        let _ = tx
-                                            .send(ResponseMessage::StreamChunk {
-                                                request_id: req.id.clone(),
-                                                chunk: encoded,
-                                            })
-                                            .await;
-                                    }
-                                    Err(e) => eprintln!("Stream error: {}", e),
-                                }
-                            }
-                            let _ = tx
-                                .send(ResponseMessage::StreamEnd {
-                                    request_id: req.id.clone(),
-                                    status_code: status,
-                                })
-                                .await;
+        match connect_async(request).await {
+            Ok((ws_stream, _)) => {
+                println!("Connected to Relay Server!");
+                let (mut write, mut read) = ws_stream.split();
+                let forwarder = std::sync::Arc::new(Forwarder::new(config.local_target.clone()));
+                // Create a channel to send messages from worker tasks to the WebSocket writer
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(100);
+
+                // Writer task
+                let write_task = tokio::spawn(async move {
+                    while let Some(msg) = rx.recv().await {
+                        if let Err(e) = write.send(msg).await {
+                            eprintln!("Failed to send message: {}", e);
+                            break;
                         }
-                        Err(e) => eprintln!("Forwarding error: {}", e),
                     }
                 });
+
+                // Heartbeat task
+                let tx_heartbeat = tx.clone();
+                let heartbeat_task = tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+                    loop {
+                        interval.tick().await;
+                        if let Err(_) = tx_heartbeat.send(Message::Ping(vec![])).await {
+                            break;
+                        }
+                    }
+                });
+
+                // Reader loop
+                while let Some(msg) = read.next().await {
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            match serde_json::from_str::<Request>(&text) {
+                                Ok(req) => {
+                                    println!(
+                                        "Received Request: [{}] {} {}",
+                                        req.id, req.method, req.path
+                                    );
+                                    let forwarder = forwarder.clone();
+                                    let tx = tx.clone();
+                                    tokio::spawn(async move {
+                                        match forwarder.forward(req.clone()).await {
+                                            Ok((status, mut stream)) => {
+                                                let mut body_bytes = Vec::new();
+                                                while let Some(chunk_res) = stream.next().await {
+                                                    if let Ok(chunk) = chunk_res {
+                                                        body_bytes.extend_from_slice(&chunk);
+                                                    }
+                                                }
+
+                                                // Try to parse as JSON, otherwise send as is (if string) or base64 (if binary? protocol unclear, assuming JSON/Text for now based on prompt)
+                                                // The struct expects Option<serde_json::Value>.
+                                                let body_json: Option<serde_json::Value> =
+                                                    serde_json::from_slice(&body_bytes).ok();
+
+                                                let resp = ResponseMessage::Response {
+                                                    request_id: req.id.clone(),
+                                                    status_code: status,
+                                                    headers: std::collections::HashMap::new(),
+                                                    body: body_json, // Sends null if not JSON.
+                                                };
+
+                                                let json = serde_json::to_string(&resp).unwrap();
+                                                match tx.send(Message::Text(json)).await {
+                                                    Ok(_) => println!(
+                                                        "Sent Response for Request [{}] Status: {}",
+                                                        req.id, status
+                                                    ),
+                                                    Err(e) => {
+                                                        eprintln!("Failed to send response: {}", e)
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => eprintln!("Forwarding error: {}", e),
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "Failed to deserialize request: {}. Message: {}",
+                                        e, text
+                                    );
+                                }
+                            }
+                        }
+                        Ok(Message::Close(frame)) => {
+                            if let Some(cf) = frame {
+                                println!("Server closed connection: {} ({})", cf.code, cf.reason);
+                            } else {
+                                println!("Server closed connection without reason.");
+                            }
+                            break;
+                        }
+                        Ok(Message::Ping(v)) => {
+                            let _ = tx.send(Message::Pong(v)).await;
+                        }
+                        Err(e) => {
+                            eprintln!("Error reading message: {}", e);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Cleanup
+                write_task.abort();
+                heartbeat_task.abort();
+                println!("Disconnected. Reconnecting in 5s...");
+            }
+            Err(e) => {
+                eprintln!("Connection failed: {}. Retrying in 5s...", e);
             }
         }
-    }
 
-    Ok(())
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    }
 }

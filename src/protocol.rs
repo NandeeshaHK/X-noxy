@@ -5,6 +5,7 @@ use std::collections::HashMap;
 pub struct Request {
     pub id: String,
     pub method: String,
+    #[serde(alias = "url")]
     pub path: String,
     pub headers: HashMap<String, String>,
     pub body: Option<serde_json::Value>,
@@ -25,5 +26,14 @@ pub enum ResponseMessage {
         request_id: String,
         #[serde(rename = "statusCode")]
         status_code: u16,
+    },
+    #[serde(rename = "response")]
+    Response {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "statusCode")]
+        status_code: u16,
+        headers: HashMap<String, String>,
+        body: Option<serde_json::Value>,
     },
 }
