@@ -38,15 +38,22 @@ impl Forwarder {
             .request(req.method.parse().unwrap_or(reqwest::Method::GET), &url);
 
         for (k, v) in req.headers {
-            // fastify/express/proxies often add host headers that mismatch the local target
-            if k.eq_ignore_ascii_case("host") || k.eq_ignore_ascii_case("origin") {
+            // Filter out headers that might cause issues or are managed by reqwest/connection
+            if k.eq_ignore_ascii_case("host")
+                || k.eq_ignore_ascii_case("origin")
+                || k.eq_ignore_ascii_case("content-length")
+                || k.eq_ignore_ascii_case("connection")
+            {
                 continue;
             }
             builder = builder.header(k, v);
         }
 
         if let Some(body) = req.body {
+            println!("Forwarding Request: {} {} with Body", req.method, url);
             builder = builder.json(&body);
+        } else {
+            println!("Forwarding Request: {} {} (No Body)", req.method, url);
         }
 
         let response = builder.send().await?;

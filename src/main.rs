@@ -101,16 +101,39 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                     }
                                                 }
 
-                                                // Try to parse as JSON, otherwise send as is (if string) or base64 (if binary? protocol unclear, assuming JSON/Text for now based on prompt)
-                                                // The struct expects Option<serde_json::Value>.
-                                                let body_json: Option<serde_json::Value> =
-                                                    serde_json::from_slice(&body_bytes).ok();
+                                                // Try to parse as JSON, otherwise send as string
+                                                let body_json = match serde_json::from_slice::<
+                                                    serde_json::Value,
+                                                >(
+                                                    &body_bytes
+                                                ) {
+                                                    Ok(v) => {
+                                                        println!(
+                                                            "Local Service Response Body: {}",
+                                                            v
+                                                        );
+                                                        Some(v)
+                                                    }
+                                                    Err(_) => {
+                                                        // Fallback: try to convert to UTF-8 string
+                                                        match String::from_utf8(body_bytes) {
+                                                            Ok(s) => {
+                                                                println!("Local Service Response Body (String): {}", s);
+                                                                Some(serde_json::Value::String(s))
+                                                            }
+                                                            Err(_) => {
+                                                                println!("Local Service Response Body: [Binary Data]");
+                                                                None
+                                                            }
+                                                        }
+                                                    }
+                                                };
 
                                                 let resp = ResponseMessage::Response {
                                                     request_id: req.id.clone(),
                                                     status_code: status,
                                                     headers: std::collections::HashMap::new(),
-                                                    body: body_json, // Sends null if not JSON.
+                                                    body: body_json,
                                                 };
 
                                                 let json = serde_json::to_string(&resp).unwrap();
@@ -124,7 +147,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                     }
                                                 }
                                             }
-                                            Err(e) => eprintln!("Forwarding error: {}", e),
+                                            Err(e) => {
+                                                eprintln!("Forwarding error: {}", e);
+                                                // Send error response to relay
+                                                let resp = ResponseMessage::Response {
+                                                    request_id: req.id.clone(),
+                                                    status_code: 502,
+                                                    headers: std::collections::HashMap::new(),
+                                                    body: Some(
+                                                        serde_json::json!({ "error": e.to_string() }),
+                                                    ),
+                                                };
+                                                if let Ok(json) = serde_json::to_string(&resp) {
+                                                    let _ = tx.send(Message::Text(json)).await;
+                                                }
+                                            }
                                         }
                                     });
                                 }
