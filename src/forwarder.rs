@@ -11,8 +11,17 @@ pub struct Forwarder {
 
 impl Forwarder {
     pub fn new(target_base: String) -> Self {
+        let client = Client::builder()
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .danger_accept_invalid_certs(true) // For local dev often useful, also avoids some TLS overhead checks
+            .user_agent("noxy-worker/0.1") // Custom minimalist UA
+            .build()
+            .unwrap_or_else(|_| Client::new());
+
         Self {
-            client: Client::new(),
+            client,
             target_base,
         }
     }
@@ -29,6 +38,10 @@ impl Forwarder {
             .request(req.method.parse().unwrap_or(reqwest::Method::GET), &url);
 
         for (k, v) in req.headers {
+            // fastify/express/proxies often add host headers that mismatch the local target
+            if k.eq_ignore_ascii_case("host") || k.eq_ignore_ascii_case("origin") {
+                continue;
+            }
             builder = builder.header(k, v);
         }
 
